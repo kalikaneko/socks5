@@ -1,3 +1,3 @@
-module github.com/haochen233/socks5
+module github.com/kalikaneko/socks5
 
 go 1.16
