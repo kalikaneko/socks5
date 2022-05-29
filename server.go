@@ -42,6 +42,8 @@ type Server struct {
 	// The server select method to use policy
 	//MethodSelector
 
+	Dial DialFunc
+
 	// Server transmit data between client and dest server.
 	// if nil, DefaultTransport is used.
 	Transporter
@@ -65,6 +67,8 @@ type Server struct {
 	activeConn map[net.Conn]struct{}
 	doneCh     chan struct{}
 }
+
+type DialFunc func(string, string) (net.Conn, error)
 
 func (srv *Server) getDoneChan() <-chan struct{} {
 	srv.mu.Lock()
@@ -265,7 +269,7 @@ func (srv *Server) serveconn(client net.Conn) {
 		srv.trackConn(remote, true)
 		defer srv.trackConn(remote, false)
 
-		errCh := srv.transport().TransportTCP(client.(*net.TCPConn), remote.(*net.TCPConn))
+		errCh := srv.transport().TransportTCP(client, remote)
 		for err := range errCh {
 			if err != nil {
 				srv.logf()(err.Error())
@@ -290,34 +294,22 @@ func (srv *Server) transport() Transporter {
 	return srv.Transporter
 }
 
+func (srv *Server) dialFn() DialFunc {
+	if srv.Dial == nil {
+		return net.Dial
+	}
+	return srv.Dial
+}
+
 var errDisableSocks4 = errors.New("socks4 server has been disabled")
 
 // handShake socks protocol handshake process
 func (srv *Server) handShake(client net.Conn) (*Request, error) {
 	//validate socks version message
-	version, err := checkVersion(client)
+	_, err := checkVersion(client)
+
 	if err != nil {
 		return nil, &OpError{Version5, "read", client.RemoteAddr(), "\"check version\"", err}
-	}
-
-	//socks4 protocol process
-	if version == Version4 {
-		if srv.DisableSocks4 {
-			//send server reject reply
-			address := &Address{net.IPv4zero, IPV4_ADDRESS, 0}
-			addr, err := address.Bytes(Version4)
-			if err != nil {
-				return nil, &OpError{Version4, "", client.RemoteAddr(), "\"authentication\"", err}
-			}
-			_, err = client.Write(append([]byte{0, Rejected}, addr...))
-			if err != nil {
-				return nil, &OpError{Version4, "write", client.RemoteAddr(), "\"authentication\"", err}
-			}
-			return nil, errDisableSocks4
-		}
-
-		//handle socks4 request
-		return srv.readSocks4Request(client)
 	}
 
 	//socks5 protocol authentication
@@ -345,34 +337,6 @@ func (srv *Server) authentication(client net.Conn) error {
 	}
 
 	return srv.MethodSelect(methods, client)
-}
-
-// readSocks4Request receive socks4 protocol client request.
-func (srv *Server) readSocks4Request(client net.Conn) (*Request, error) {
-	reply := &Reply{
-		VER:     Version4,
-		Address: &Address{net.IPv4zero, IPV4_ADDRESS, 0},
-	}
-	req := &Request{
-		VER: Version4,
-	}
-	// CMD
-	cmd, err := ReadNBytes(client, 1)
-	if err != nil {
-		return nil, &OpError{req.VER, "read", client.RemoteAddr(), "\"process request command\"", err}
-	}
-	req.CMD = cmd[0]
-	// DST.PORT, DST.IP
-	addr, rep, err := readAddress(client, req.VER)
-	if err != nil {
-		reply.REP = rep
-		err := srv.sendReply(client, reply)
-		if err != nil {
-			return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request address type\"", err}
-		}
-	}
-	req.Address = addr
-	return req, nil
 }
 
 // readSocks5Request read socks5 protocol client request.
@@ -427,232 +391,137 @@ func (srv *Server) establish(client net.Conn, req *Request) (dest net.Conn, err 
 		VER:     req.VER,
 		Address: &Address{net.IPv4zero, IPV4_ADDRESS, 0},
 	}
-
-	// version4
-	if req.VER == Version4 {
-		switch req.CMD {
-		case CONNECT:
-			// dial to dest host.
-			dest, err = net.Dial("tcp", req.Address.String())
-			if err != nil {
-				reply.REP = Rejected
-				err2 := srv.sendReply(client, reply)
-				if err != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
-				}
-				return nil, err
-			}
-
-			// parse remote host address.
-			remoteAddr, err := ParseAddress(dest.RemoteAddr().String())
-			if err != nil {
-				reply.REP = Rejected
-				err2 := srv.sendReply(client, reply)
-				if err2 != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
-				}
-				return nil, err
-			}
-			reply.Address = remoteAddr
-
-			// success
-			reply.REP = Granted
-			err = srv.sendReply(client, reply)
-			if err != nil {
-				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
-			}
-		case BIND:
-			bindAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(srv.BindIP, "0"))
-			if err != nil {
-				return nil, err
-			}
-
-			// start listening on random port.
-			bindServer, err := net.ListenTCP("tcp", bindAddr)
-			if err != nil {
-				reply.REP = Rejected
-				err2 := srv.sendReply(client, reply)
-				if err2 != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
-				}
-				return nil, err
-			}
-			defer bindServer.Close()
-			reply.REP = Granted
-			reply.Address, err = ParseAddress(bindServer.Addr().String())
-			if err != nil {
-				return nil, err
-			}
-
-			// send first reply to client.
-			err = srv.sendReply(client, reply)
-			if err != nil {
-				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
-			}
-			// waiting target host connect.
-			dest, err = bindServer.Accept()
-			if err != nil {
-				reply.REP = Rejected
-				err2 := srv.sendReply(client, reply)
-				if err2 != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
-				}
-				return nil, err
-			}
-
-			// send second reply to client.
-			if req.Address.String() == dest.RemoteAddr().String() {
-				err2 := srv.sendReply(client, reply)
-				if err2 != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
-				}
-			} else {
-				reply.REP = Rejected
-				err = srv.sendReply(client, reply)
-				if err != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
-				}
-			}
-		default:
-			reply.REP = Rejected
-			err = srv.sendReply(client, reply)
-			if err != nil {
-				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
-			}
-			return nil, &OpError{req.VER, "", client.RemoteAddr(), "\"process request\"", &CMDError{req.CMD}}
-		}
-	} else if req.VER == Version5 { // version5
-		switch req.CMD {
-		case CONNECT:
-			// dial dest host.
-			dest, err = net.Dial("tcp", req.Address.String())
-			if err != nil {
-				reply.REP = HOST_UNREACHABLE
-				err2 := srv.sendReply(client, reply)
-				if err2 != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
-
-				}
-				return nil, err
-			}
-
-			// parse remote host address.
-			remoteAddr, err := ParseAddress(dest.RemoteAddr().String())
-			if err != nil {
-				reply.REP = GENERAL_SOCKS_SERVER_FAILURE
-				err2 := srv.sendReply(client, reply)
-				if err2 != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
-				}
-				return nil, err
-			}
-			reply.Address = remoteAddr
-
-			// success
-			reply.REP = SUCCESSED
-			err = srv.sendReply(client, reply)
-			if err != nil {
-				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
-			}
-		case UDP_ASSOCIATE:
-			addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(srv.BindIP, "0"))
-			if err != nil {
-				return nil, err
-			}
-
-			// start udp listening on random port.
-			dest, err = net.ListenUDP("udp", addr)
-			if err != nil {
-				reply.REP = GENERAL_SOCKS_SERVER_FAILURE
-				err2 := srv.sendReply(client, reply)
-				if err2 != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
-				}
-				return nil, err
-			}
-
-			// success
-			reply.REP = SUCCESSED
-			relayAddr, err := ParseAddress(dest.LocalAddr().String())
-			if err != nil {
-				return nil, err
-			}
-			reply.Address = relayAddr
-			err = srv.sendReply(client, reply)
-			if err != nil {
-				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
-			}
-		case BIND:
-			bindAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(srv.BindIP, "0"))
-			if err != nil {
-				return nil, err
-			}
-
-			// start tcp listening on random port.
-			bindServer, err := net.ListenTCP("tcp", bindAddr)
-			if err != nil {
-				reply.REP = GENERAL_SOCKS_SERVER_FAILURE
-				err2 := srv.sendReply(client, reply)
-				if err2 != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
-				}
-				return nil, err
-			}
-			defer bindServer.Close()
-			reply.REP = SUCCESSED
-			reply.Address, err = ParseAddress(bindServer.Addr().String())
-			if err != nil {
-				return nil, err
-			}
-
-			// send first reply to client.
-			err = srv.sendReply(client, reply)
-			if err != nil {
-				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
-			}
-			dest, err = bindServer.Accept()
-			if err != nil {
-				reply.REP = GENERAL_SOCKS_SERVER_FAILURE
-				err2 := srv.sendReply(client, reply)
-				if err2 != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
-				}
-				return nil, err
-			}
-
-			// send second reply to client.
-			if req.Address.String() == dest.RemoteAddr().String() {
-				reply.Address, err = ParseAddress(dest.RemoteAddr().String())
-				if err != nil {
-					return nil, err
-				}
-				err = srv.sendReply(client, reply)
-				if err != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
-				}
-			} else {
-				reply.REP = GENERAL_SOCKS_SERVER_FAILURE
-				err = srv.sendReply(client, reply)
-				if err != nil {
-					return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
-				}
-			}
-		default:
-			reply.REP = COMMAND_NOT_SUPPORTED
-			err = srv.sendReply(client, reply)
-			if err != nil {
-				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
-			}
-
-			return nil, &OpError{Version5, "", client.RemoteAddr(), "\"process request\"", &CMDError{req.CMD}}
-		}
-	} else { // unknown version
+	if req.VER != Version5 {
+		// unknown version
 		return nil, &VersionError{req.VER}
+	}
+
+	switch req.CMD {
+	case CONNECT:
+		// dial dest host.
+		dest, err = srv.dialFn()("tcp", req.Address.String())
+		if err != nil {
+			reply.REP = HOST_UNREACHABLE
+			err2 := srv.sendReply(client, reply)
+			if err2 != nil {
+				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
+
+			}
+			return nil, err
+		}
+
+		// parse remote host address.
+		remoteAddr, err := ParseAddress(dest.RemoteAddr().String())
+		if err != nil {
+			reply.REP = GENERAL_SOCKS_SERVER_FAILURE
+			err2 := srv.sendReply(client, reply)
+			if err2 != nil {
+				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
+			}
+			return nil, err
+		}
+		reply.Address = remoteAddr
+
+		// success
+		reply.REP = SUCCESSED
+		err = srv.sendReply(client, reply)
+		if err != nil {
+			return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
+		}
+	case UDP_ASSOCIATE:
+		addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(srv.BindIP, "0"))
+		if err != nil {
+			return nil, err
+		}
+
+		// start udp listening on random port.
+		dest, err = net.ListenUDP("udp", addr)
+		if err != nil {
+			reply.REP = GENERAL_SOCKS_SERVER_FAILURE
+			err2 := srv.sendReply(client, reply)
+			if err2 != nil {
+				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
+			}
+			return nil, err
+		}
+
+		// success
+		reply.REP = SUCCESSED
+		relayAddr, err := ParseAddress(dest.LocalAddr().String())
+		if err != nil {
+			return nil, err
+		}
+		reply.Address = relayAddr
+		err = srv.sendReply(client, reply)
+		if err != nil {
+			return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
+		}
+	case BIND:
+		bindAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(srv.BindIP, "0"))
+		if err != nil {
+			return nil, err
+		}
+
+		// start tcp listening on random port.
+		bindServer, err := net.ListenTCP("tcp", bindAddr)
+		if err != nil {
+			reply.REP = GENERAL_SOCKS_SERVER_FAILURE
+			err2 := srv.sendReply(client, reply)
+			if err2 != nil {
+				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
+			}
+			return nil, err
+		}
+		defer bindServer.Close()
+		reply.REP = SUCCESSED
+		reply.Address, err = ParseAddress(bindServer.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+
+		// send first reply to client.
+		err = srv.sendReply(client, reply)
+		if err != nil {
+			return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
+		}
+		dest, err = bindServer.Accept()
+		if err != nil {
+			reply.REP = GENERAL_SOCKS_SERVER_FAILURE
+			err2 := srv.sendReply(client, reply)
+			if err2 != nil {
+				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err2}
+			}
+			return nil, err
+		}
+
+		// send second reply to client.
+		if req.Address.String() == dest.RemoteAddr().String() {
+			reply.Address, err = ParseAddress(dest.RemoteAddr().String())
+			if err != nil {
+				return nil, err
+			}
+			err = srv.sendReply(client, reply)
+			if err != nil {
+				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
+			}
+		} else {
+			reply.REP = GENERAL_SOCKS_SERVER_FAILURE
+			err = srv.sendReply(client, reply)
+			if err != nil {
+				return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
+			}
+		}
+	default:
+		reply.REP = COMMAND_NOT_SUPPORTED
+		err = srv.sendReply(client, reply)
+		if err != nil {
+			return nil, &OpError{req.VER, "write", client.RemoteAddr(), "\"process request\"", err}
+		}
+
+		return nil, &OpError{Version5, "", client.RemoteAddr(), "\"process request\"", &CMDError{req.CMD}}
 	}
 	return
 }
-
-var errErrorATPE = errors.New("socks4 server bind address type should be ipv4")
 
 // sendReply The server send socks protocol reply to client
 func (srv *Server) sendReply(out io.Writer, r *Reply) error {
@@ -780,3 +649,5 @@ func (o *OpError) Error() string {
 	str += ":" + o.Err.Error()
 	return str
 }
+
+var errErrorATPE = errors.New("socks4 server bind address type should be ipv4")
